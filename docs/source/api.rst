@@ -36,6 +36,7 @@ latest_requests
 .. autofunction:: httpretty.latest_requests
 
 
+.. automodule:: httpretty
 
 .. _activate:
 
@@ -51,7 +52,15 @@ activate
 httprettified
 -------------
 
-.. autoclass:: httpretty.core.httprettified
+.. autofunction:: httpretty.core.httprettified
+
+
+.. _enabled:
+
+enabled
+-------
+
+.. autoclass:: httpretty.enabled
    :members:
 
 

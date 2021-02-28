@@ -1,7 +1,5 @@
-# #!/usr/bin/env python
-# -*- coding: utf-8 -*-
 # <HTTPretty - HTTP client mock for Python>
-# Copyright (C) <2011-2018>  Gabriel Falcao <gabriel@nacaolivre.org>
+# Copyright (C) <2011-2020> Gabriel Falcão <gabriel@nacaolivre.org>
 #
 # Permission is hereby granted, free of charge, to any person
 # obtaining a copy of this software and associated documentation
@@ -23,15 +21,17 @@
 # WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 # FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
-from __future__ import unicode_literals
 
+import io
 import codecs
 import contextlib
 import functools
 import hashlib
 import inspect
+import logging
 import itertools
 import json
+import types
 import re
 import socket
 import tempfile
@@ -40,12 +40,9 @@ import traceback
 import warnings
 
 from functools import partial
+from typing import Callable
 
 from .compat import (
-    PY3,
-    StringIO,
-    text_type,
-    binary_type,
     BaseClass,
     BaseHTTPRequestHandler,
     quote,
@@ -56,8 +53,6 @@ from .compat import (
     urlsplit,
     parse_qs,
     unquote_utf8,
-    ClassTypes,
-    basestring
 )
 from .http import (
     STATUSES,
@@ -78,6 +73,7 @@ from datetime import timedelta
 from errno import EAGAIN
 
 old_socket = socket.socket
+old_socketpair = getattr(socket, 'socketpair', None)
 old_SocketType = socket.SocketType
 old_create_connection = socket.create_connection
 old_gethostbyname = socket.gethostbyname
@@ -88,10 +84,13 @@ old_ssl_wrap_socket = None
 old_sslwrap_simple = None
 old_sslsocket = None
 old_sslcontext_wrap_socket = None
+old_sslcontext = None
 
 MULTILINE_ANY_REGEX = re.compile(r'.*', re.M)
 hostname_re = re.compile(r'\^?(?:https?://)?[^:/]*[:/]?')
 
+
+logger = logging.getLogger(__name__)
 
 try:  # pragma: no cover
     import socks
@@ -101,16 +100,27 @@ except ImportError:
 
 try:  # pragma: no cover
     import ssl
-    old_ssl_wrap_socket = ssl.wrap_socket
+    old_sslcontext_class = ssl.SSLContext
+    old_sslcontext = ssl.create_default_context()
+    old_ssl_wrap_socket = old_sslcontext.wrap_socket
     try:
         old_sslcontext_wrap_socket = ssl.SSLContext.wrap_socket
     except AttributeError:
         pass
-    if not PY3:
-        old_sslwrap_simple = ssl.sslwrap_simple
     old_sslsocket = ssl.SSLSocket
 except ImportError:  # pragma: no cover
     ssl = None
+
+try:
+    import _ssl
+except ImportError:
+    _ssl = None
+# used to handle error caused by ndg-httpsclient
+try:
+    from requests.packages.urllib3.contrib.pyopenssl import inject_into_urllib3, extract_from_urllib3
+    pyopenssl_override = True
+except Exception:
+    pyopenssl_override = False
 
 
 try:
@@ -118,6 +128,13 @@ try:
     old_requests_ssl_wrap_socket = requests_urllib3_connection.ssl_wrap_socket
 except ImportError:
     requests_urllib3_connection = None
+    old_requests_ssl_wrap_socket = None
+
+try:
+    import eventlet
+    import eventlet.green
+except ImportError:
+    eventlet = None
 
 DEFAULT_HTTP_PORTS = frozenset([80])
 POTENTIAL_HTTP_PORTS = set(DEFAULT_HTTP_PORTS)
@@ -135,8 +152,8 @@ class HTTPrettyRequest(BaseHTTPRequestHandler, BaseClass):
     ``\r\n`` separated string with HTTP headers and parse them out using
     the internal `parse_request` method.
 
-    It also replaces the `rfile` and `wfile` attributes with StringIO
-    instances so that we guarantee that it won't make any I/O, neighter
+    It also replaces the `rfile` and `wfile` attributes with :py:class:`io.BytesIO`
+    instances so that we guarantee that it won't make any I/O, neither
     for writing nor reading.
 
     It has some convenience attributes:
@@ -172,11 +189,11 @@ class HTTPrettyRequest(BaseHTTPRequestHandler, BaseClass):
 
         # Now let's concatenate the headers with the body, and create
         # `rfile` based on it
-        self.rfile = StringIO(b'\r\n\r\n'.join([self.raw_headers, self.body]))
+        self.rfile = io.BytesIO(b'\r\n\r\n'.join([self.raw_headers, self.body]))
 
-        # Creating `wfile` as an empty StringIO, just to avoid any
+        # Creating `wfile` as an empty BytesIO, just to avoid any
         # real I/O calls
-        self.wfile = StringIO()
+        self.wfile = io.BytesIO()
 
         # parsing the request line preemptively
         self.raw_requestline = self.rfile.readline()
@@ -273,7 +290,7 @@ class HTTPrettyRequest(BaseHTTPRequestHandler, BaseClass):
         try:
             body = decode_utf8(body)
             return do_parse(body)
-        except (Exception, BaseException):
+        except Exception:
             return body
 
 
@@ -319,6 +336,12 @@ class FakeSockFile(object):
     def __getattr__(self, name):
         return getattr(self.file, name)
 
+    def __del__(self):
+        try:
+            self.close()
+        except (ValueError, AttributeError):
+            pass
+
 
 class FakeSSLSocket(object):
     """Shorthand for :py:class:`~httpretty.core.fakesock`
@@ -329,6 +352,18 @@ class FakeSSLSocket(object):
     def __getattr__(self, attr):
         return getattr(self._httpretty_sock, attr)
 
+
+class FakeAddressTuple(object):
+    def __init__(self, fakesocket):
+        self.fakesocket = fakesocket
+
+    def __getitem__(self, *args, **kw):
+        raise AssertionError('socket {} is not connected'.format(self.fakesocket.truesock))
+
+
+def fake_socketpair(*args, **kw):
+    with restored_libs():
+        return old_socketpair(*args, **kw)
 
 class fakesock(object):
     """
@@ -341,19 +376,32 @@ class fakesock(object):
         debuglevel = 0
         _sent_data = []
 
-        def __init__(self, family=socket.AF_INET, type=socket.SOCK_STREAM,
-                     protocol=0, _sock=None):
-            self.truesock = (old_socket(family, type, protocol)
-                             if httpretty.allow_net_connect
-                             else None)
-            self._connected_truesock = False
-            self._closed = True
+        def __init__(
+            self,
+            family=socket.AF_INET,
+            type=socket.SOCK_STREAM,
+            proto=0,
+            fileno=None
+        ):
+            self.socket_family = family
+            self.socket_type = type
+            self.socket_proto = proto
+            if httpretty.allow_net_connect:
+                self.truesock = self.create_socket()
+            else:
+                self.truesock = None
+
+            self._address = FakeAddressTuple(self)
+            self.__truesock_is_connected__ = False
             self.fd = FakeSockFile()
-            self.fd.socket = _sock or self
+            self.fd.socket = fileno or self
             self.timeout = socket._GLOBAL_DEFAULT_TIMEOUT
-            self._sock = _sock or self
+            self._sock = fileno or self
             self.is_http = False
-            self._bufsize = 1024
+            self._bufsize = 32 * 1024
+
+        def create_socket(self):
+            return old_socket(self.socket_family, self.socket_type, self.socket_proto)
 
         def getpeercert(self, *a, **kw):
             now = datetime.now()
@@ -383,12 +431,15 @@ class fakesock(object):
             return sock
 
         def setsockopt(self, level, optname, value):
-            if self.truesock:
-                self.truesock.setsockopt(level, optname, value)
+            if httpretty.allow_net_connect and not self.truesock:
+                self.truesock = self.create_socket()
+            elif not self.truesock:
+                logger.debug('setsockopt(%s, %s, %s) failed', level, optname, value)
+                return
+
+            return self.truesock.setsockopt(level, optname, value)
 
         def connect(self, address):
-            self._closed = False
-
             try:
                 self._address = (self._host, self._port) = address
             except ValueError:
@@ -403,16 +454,55 @@ class fakesock(object):
                 self.is_http = self._port in ports_to_check
 
             if not self.is_http:
-                if self.truesock and not self._connected_truesock:
-                    self.truesock.connect(self._address)
-                    self._connected_truesock = True
-                else:
-                    raise UnmockedError()
-            elif self.truesock and not self._connected_truesock:
+                self.connect_truesock()
+            elif self.truesock and not self.real_socket_is_connected():
+                # TODO: remove nested if
                 matcher = httpretty.match_http_address(self._host, self._port)
                 if matcher is None:
-                    self.truesock.connect(self._address)
-                    self._connected_truesock = True
+                    self.connect_truesock()
+
+        def bind(self, address):
+            self._address = (self._host, self._port) = address
+            if self.truesock:
+                self.bind_truesock(address)
+
+        def bind_truesock(self, address):
+            if httpretty.allow_net_connect and not self.truesock:
+                self.truesock = self.create_socket()
+            elif not self.truesock:
+                raise UnmockedError()
+
+            return self.truesock.bind(address)
+
+        def connect_truesock(self):
+            if self.__truesock_is_connected__:
+                return self.truesock
+
+            if httpretty.allow_net_connect and not self.truesock:
+                self.truesock = self.create_socket()
+            elif not self.truesock:
+                raise UnmockedError()
+            undo_patch_socket()
+            try:
+                hostname = self._address[0]
+                port = 80
+                if len(self._address) == 2:
+                    port = self._address[1]
+                if port ==  443 and old_sslsocket:
+                    self.truesock = old_ssl_wrap_socket(self.truesock, server_hostname=hostname)
+
+                sock = self.truesock
+
+                sock.connect(self._address)
+                self.__truesock_is_connected__ = True
+                self.truesock = sock
+            finally:
+                apply_patch_socket()
+
+            return self.truesock
+
+        def real_socket_is_connected(self):
+            return self.__truesock_is_connected__
 
         def fileno(self):
             if self.truesock:
@@ -420,10 +510,10 @@ class fakesock(object):
             return self.fd.fileno()
 
         def close(self):
-            if self._connected_truesock:
+            if self.truesock:
                 self.truesock.close()
-                self._connected_truesock = False
-            self._closed = True
+                self.truesock = None
+                self.__truesock_is_connected__ = False
 
         def makefile(self, mode='r', bufsize=-1):
             """Returns this fake socket's own tempfile buffer.
@@ -445,7 +535,7 @@ class fakesock(object):
                 else:
                     timeout = self.timeout
                 t.join(timeout)
-                if t.isAlive():
+                if t.is_alive():
                     raise socket.timeout
 
             return self.fd
@@ -459,19 +549,17 @@ class fakesock(object):
             buffer so that HTTPretty can return it accordingly when
             necessary.
             """
-            if not self.truesock:
+
+            if httpretty.allow_net_connect and not self.truesock:
+                self.connect_truesock()
+            elif not self.truesock:
                 raise UnmockedError()
 
             if not self.is_http:
+                self.truesock.setblocking(1)
                 return self.truesock.sendall(data, *args, **kw)
 
-            if self._address[1] == 443 and old_sslsocket:
-                sock = old_sslsocket(self.truesock)
-            else:
-                sock = self.truesock
-
-            if not self._connected_truesock:
-                sock.connect(self._address)
+            sock = self.connect_truesock()
 
             sock.setblocking(1)
             sock.sendall(data, *args, **kw)
@@ -491,9 +579,18 @@ class fakesock(object):
             self.fd.seek(0)
 
         def sendall(self, data, *args, **kw):
+            # if self.__truesock_is_connected__:
+            #     return self.truesock.sendall(data, *args, **kw)
+
             self._sent_data.append(data)
             self.fd = FakeSockFile()
             self.fd.socket = self
+            if isinstance(data, str):
+                data = data.encode('utf-8')
+            elif not isinstance(data, bytes):
+                logger.debug('cannot sendall({data!r})')
+                data = bytes(data)
+
             try:
                 requestline, _ = data.split(b'\r\n', 1)
                 method, path, version = parse_requestline(
@@ -527,6 +624,8 @@ class fakesock(object):
                     httpretty.historify_request(headers, body, False)
                     return
 
+            if path[:2] == '//':
+                path = '//' + path
             # path might come with
             s = urlsplit(path)
             POTENTIAL_HTTP_PORTS.add(int(s.port or 80))
@@ -556,46 +655,53 @@ class fakesock(object):
 
             self._entry = matcher.get_next_entry(method, info, request)
 
-        def debug(self, truesock_func, *a, **kw):
-            if self.is_http:
-                frame = inspect.stack()[0][0]
-                lines = list(map(utf8, traceback.format_stack(frame)))
-
-                message = [
-                    "HTTPretty intercepted and unexpected socket method call.",
-                    ("Please open an issue at "
-                     "'https://github.com/gabrielfalcao/HTTPretty/issues'"),
-                    "And paste the following traceback:\n",
-                    "".join(decode_utf8(lines)),
-                ]
-                raise RuntimeError("\n".join(message))
+        def forward_and_trace(self, function_name, *a, **kw):
             if not self.truesock:
                 raise UnmockedError()
-            return getattr(self.truesock, truesock_func)(*a, **kw)
+
+            callback = getattr(self.truesock, function_name)
+            return callback(*a, **kw)
 
         def settimeout(self, new_timeout):
             self.timeout = new_timeout
+            if not self.is_http:
+                if self.truesock:
+                    self.truesock.settimeout(new_timeout)
 
         def send(self, *args, **kwargs):
-            return self.debug('send', *args, **kwargs)
+            return self.forward_and_trace('send', *args, **kwargs)
 
         def sendto(self, *args, **kwargs):
-            return self.debug('sendto', *args, **kwargs)
+            return self.forward_and_trace('sendto', *args, **kwargs)
 
         def recvfrom_into(self, *args, **kwargs):
-            return self.debug('recvfrom_into', *args, **kwargs)
+            return self.forward_and_trace('recvfrom_into', *args, **kwargs)
 
         def recv_into(self, *args, **kwargs):
-            return self.debug('recv_into', *args, **kwargs)
+            return self.forward_and_trace('recv_into', *args, **kwargs)
 
         def recvfrom(self, *args, **kwargs):
-            return self.debug('recvfrom', *args, **kwargs)
+            return self.forward_and_trace('recvfrom', *args, **kwargs)
 
-        def recv(self, *args, **kwargs):
-            return self.debug('recv', *args, **kwargs)
+        def recv(self, buffersize=None, *args, **kwargs):
+            buffersize = buffersize or self._bufsize
+            return self.forward_and_trace('recv', buffersize, *args, **kwargs)
 
         def __getattr__(self, name):
-            if not self.truesock:
+            if httpretty.allow_net_connect and not self.truesock:
+                # can't call self.connect_truesock() here because we
+                # don't know if user wants to execute server of client
+                # calls (or can they?)
+                self.truesock = self.create_socket()
+            elif not self.truesock:
+                # Special case for
+                # `hasattr(sock, "version")` call added in urllib3>=1.26.
+                if name == 'version':
+                    raise AttributeError(
+                        "HTTPretty synthesized this error to fix urllib3 compatibility "
+                        "(see issue https://github.com/gabrielfalcao/HTTPretty/issues/409). "
+                        "Please open an issue if this error causes further unexpected issues."
+                    )
                 raise UnmockedError()
             return getattr(self.truesock, name)
 
@@ -607,7 +713,7 @@ def fake_wrap_socket(orig_wrap_socket_fn, *args, **kw):
     if server_hostname is not None:
         matcher = httpretty.match_https_hostname(server_hostname)
         if matcher is None:
-                return orig_wrap_socket_fn(*args, **kw)
+            return orig_wrap_socket_fn(*args, **kw)
     if 'sock' in kw:
         return kw['sock']
     else:
@@ -622,6 +728,10 @@ def create_fake_connection(
     s = fakesock.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
     if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
         s.settimeout(timeout)
+
+    if isinstance(source_address, tuple) and len(source_address) == 2:
+        source_address[1] = int(source_address[1])
+
     if source_address:
         s.bind(source_address)
     s.connect(address)
@@ -642,6 +752,8 @@ def fake_getaddrinfo(
         host, port, family=None, socktype=None, proto=None, flags=None):
     """drop-in replacement for :py:func:`socket.getaddrinfo`"""
     return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP,
+             '', (host, port)),
+            (socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP,
              '', (host, port))]
 
 
@@ -650,16 +762,20 @@ class Entry(BaseClass):
     stored in memory as internal representation of a HTTP
     request/response definition.
 
-    :param method: string
-    :param uri: string
-    :param body: string
-    :param adding_headers: dict - headers to be added to the response
-    :param forcing_headers: dict - headers to be forcefully set in the response
-    :param status: an integer (e.g.: ``status=200``)
-    :param streaming: bool - whether to stream the response
-    :param headers: keyword-args with headers to be added to the response
+    Args:
+        method (str): One of ``httpretty.GET``, ``httpretty.PUT``, ``httpretty.POST``, ``httpretty.DELETE``, ``httpretty.HEAD``, ``httpretty.PATCH``, ``httpretty.OPTIONS``, ``httpretty.CONNECT``.
+        uri (str|re.Pattern): The URL to match
+        adding_headers (dict): Extra headers to be added to the response
+        forcing_headers (dict): Overwrite response headers.
+        status (int): The status code for the response, defaults to ``200``.
+        streaming (bool): Whether should stream the response into chunks via generator.
+        headers: Headers to inject in the faked response.
 
-    .. warning:: When using the ``forcing_headers`` option make sure to add the header ``Content-Length`` otherwise calls using :py:mod:`requests` will try to load the response endlessly.
+    Returns:
+        httpretty.Entry: containing the request-matching metadata.
+
+
+    .. warning:: When using the ``forcing_headers`` option make sure to add the header ``Content-Length`` to match at most the total body length, otherwise some HTTP clients can hang indefinitely.
     """
     def __init__(self, method, uri, body,
                  adding_headers=None,
@@ -678,7 +794,7 @@ class Entry(BaseClass):
             self.callable_body = body
             self.body = None
             self.body_is_callable = True
-        elif isinstance(body, text_type):
+        elif isinstance(body, str):
             self.body = utf8(body)
         else:
             self.body = body
@@ -915,7 +1031,7 @@ class URIInfo(BaseClass):
         return self.to_str(attrs)
 
     def __hash__(self):
-        return int(hashlib.sha1(binary_type(self, 'ascii')).hexdigest(), 16)
+        return int(hashlib.sha1(bytes(self, 'ascii')).hexdigest(), 16)
 
     def __eq__(self, other):
         self_tuple = (
@@ -1008,7 +1124,7 @@ class URIMatcher(object):
 
         self.entries = entries
         self.priority = priority
-
+        self.uri = uri
         # hash of current_entry pointers, per method.
         self.current_entries = {}
 
@@ -1024,9 +1140,9 @@ class URIMatcher(object):
         wrap = 'URLMatcher({})'
         if self.info:
             if self._match_querystring:
-                return wrap.format(text_type(self.info.str_with_query()))
+                return wrap.format(str(self.info.str_with_query()))
             else:
-                return wrap.format(text_type(self.info))
+                return wrap.format(str(self.info))
         else:
             return wrap.format(self.regex.pattern)
 
@@ -1052,20 +1168,28 @@ class URIMatcher(object):
         if self.current_entries[method] != -1:
             self.current_entries[method] += 1
 
+        # Create a copy of the original entry to make it thread-safe
+        body = entry.callable_body if entry.body_is_callable else entry.body
+        new_entry = Entry(entry.method, entry.uri, body,
+                          status=entry.status,
+                          streaming=entry.streaming,
+                          adding_headers=entry.adding_headers,
+                          forcing_headers=entry.forcing_headers)
+
         # Attach more info to the entry
         # So the callback can be more clever about what to do
         # This does also fix the case where the callback
         # would be handed a compiled regex as uri instead of the
         # real uri
-        entry.info = info
-        entry.request = request
-        return entry
+        new_entry.info = info
+        new_entry.request = request
+        return new_entry
 
     def __hash__(self):
-        return hash(text_type(self))
+        return hash(str(self))
 
     def __eq__(self, other):
-        return text_type(self) == text_type(other)
+        return str(self) == str(other)
 
 
 class httpretty(HttpBaseClass):
@@ -1329,9 +1453,8 @@ class httpretty(HttpBaseClass):
 
            assert httpretty.latest_requests[-1].url == 'https://httpbin.org/ip'
 
-
         :param method: one of ``httpretty.GET``, ``httpretty.PUT``, ``httpretty.POST``, ``httpretty.DELETE``, ``httpretty.HEAD``, ``httpretty.PATCH``, ``httpretty.OPTIONS``, ``httpretty.CONNECT``
-        :param uri: a string (e.g.: **"https://httpbin.org/ip"**)
+        :param uri: a string or regex pattern (e.g.: **"https://httpbin.org/ip"**)
         :param body: a string, defaults to ``{"message": "HTTPretty :)"}``
         :param adding_headers: dict - headers to be added to the response
         :param forcing_headers: dict - headers to be forcefully set in the response
@@ -1340,8 +1463,10 @@ class httpretty(HttpBaseClass):
         :param priority: an integer, useful for setting higher priority over previously registered urls. defaults to zero
         :param match_querystring: bool - whether to take the querystring into account when matching an URL
         :param headers: headers to be added to the response
+
+        .. warning:: When using a port in the request, add a trailing slash if no path is provided otherwise Httpretty will not catch the request.  Ex: ``httpretty.register_uri(httpretty.GET, 'http://fakeuri.com:8080/', body='{"hello":"world"}')``
         """
-        uri_is_string = isinstance(uri, basestring)
+        uri_is_string = isinstance(uri, str)
 
         if uri_is_string and re.search(r'^\w+://[^/]+[.]\w{2,}$', uri):
             uri += '/'
@@ -1352,10 +1477,10 @@ class httpretty(HttpBaseClass):
                 response.method = method
             entries_for_this_uri = responses
         else:
-            headers[str('body')] = body
-            headers[str('adding_headers')] = adding_headers
-            headers[str('forcing_headers')] = forcing_headers
-            headers[str('status')] = status
+            headers['body'] = body
+            headers['adding_headers'] = adding_headers
+            headers['forcing_headers'] = forcing_headers
+            headers['status'] = status
 
             entries_for_this_uri = [
                 cls.Response(method=method, uri=uri, **headers),
@@ -1382,19 +1507,24 @@ class httpretty(HttpBaseClass):
             status=200,
             streaming=False,
             **kw):
-        """
-        shortcut to create an :py:class:`~httpretty.core.Entry` that takes the body as first positional argument
+        """Shortcut to create an :py:class:`~httpretty.core.Entry` that takes
+        the body as first positional argument.
 
-        .. seealso:: the parameters of this function match those of the :py:class:`~httpretty.core.Entry` constructor
-        :param body:
-        :param method: one of ``httpretty.GET``, ``httpretty.PUT``, ``httpretty.POST``, ``httpretty.DELETE``, ``httpretty.HEAD``, ``httpretty.PATCH``, ``httpretty.OPTIONS``, ``httpretty.CONNECT``
-        :param uri:
-        :param adding_headers:
-        :param forcing_headers:
-        :param status: defaults to **200**
-        :param streaming: defaults to **False**
-        :param kw: keyword-arguments passed onto the :py:class:`~httpretty.core.Entry`
-        :returns: an :py:class:`~httpretty.core.Entry`
+        .. seealso:: the parameters of this function match those of
+                     the :py:class:`~httpretty.core.Entry` constructor.
+
+        Args:
+            body (str): The body to return as response..
+            method (str): One of ``httpretty.GET``, ``httpretty.PUT``, ``httpretty.POST``, ``httpretty.DELETE``, ``httpretty.HEAD``, ``httpretty.PATCH``, ``httpretty.OPTIONS``, ``httpretty.CONNECT``.
+            uri (str|re.Pattern): The URL to match
+            adding_headers (dict): Extra headers to be added to the response
+            forcing_headers (dict): Overwrite **any** response headers, even "Content-Length".
+            status (int): The status code for the response, defaults to ``200``.
+            streaming (bool): Whether should stream the response into chunks via generator.
+            kwargs: Keyword-arguments are forwarded to :py:class:`~httpretty.core.Entry`
+
+        Returns:
+            httpretty.Entry: containing the request-matching metadata.
         """
         kw['body'] = body
         kw['adding_headers'] = adding_headers
@@ -1424,48 +1554,9 @@ class httpretty(HttpBaseClass):
 
         .. note:: This method does not call :py:meth:`httpretty.core.reset` automatically.
         """
+        undo_patch_socket()
         cls._is_enabled = False
-        socket.socket = old_socket
-        socket.SocketType = old_SocketType
-        socket._socketobject = old_socket
 
-        socket.create_connection = old_create_connection
-        socket.gethostname = old_gethostname
-        socket.gethostbyname = old_gethostbyname
-        socket.getaddrinfo = old_getaddrinfo
-
-        socket.__dict__['socket'] = old_socket
-        socket.__dict__['_socketobject'] = old_socket
-        socket.__dict__['SocketType'] = old_SocketType
-
-        socket.__dict__['create_connection'] = old_create_connection
-        socket.__dict__['gethostname'] = old_gethostname
-        socket.__dict__['gethostbyname'] = old_gethostbyname
-        socket.__dict__['getaddrinfo'] = old_getaddrinfo
-
-        if socks:
-            socks.socksocket = old_socksocket
-            socks.__dict__['socksocket'] = old_socksocket
-
-        if ssl:
-            ssl.wrap_socket = old_ssl_wrap_socket
-            ssl.SSLSocket = old_sslsocket
-            try:
-                ssl.SSLContext.wrap_socket = old_sslcontext_wrap_socket
-            except AttributeError:
-                pass
-            ssl.__dict__['wrap_socket'] = old_ssl_wrap_socket
-            ssl.__dict__['SSLSocket'] = old_sslsocket
-
-            if not PY3:
-                ssl.sslwrap_simple = old_sslwrap_simple
-                ssl.__dict__['sslwrap_simple'] = old_sslwrap_simple
-
-        if requests_urllib3_connection is not None:
-            requests_urllib3_connection.ssl_wrap_socket = \
-                old_requests_ssl_wrap_socket
-            requests_urllib3_connection.__dict__['ssl_wrap_socket'] = \
-                old_requests_ssl_wrap_socket
 
     @classmethod
     def is_enabled(cls):
@@ -1513,59 +1604,130 @@ class httpretty(HttpBaseClass):
         .. warning:: after calling this method the original :py:mod:`socket` is replaced with :py:class:`httpretty.core.fakesock`. Make sure to call :py:meth:`~httpretty.disable` after done with your tests or use the :py:class:`httpretty.enabled` as decorator or `context-manager <https://docs.python.org/3/reference/datamodel.html#context-managers>`_
         """
         cls.allow_net_connect = allow_net_connect
+        apply_patch_socket()
         cls._is_enabled = True
-        # Some versions of python internally shadowed the
-        # SocketType variable incorrectly https://bugs.python.org/issue20386
-        bad_socket_shadow = (socket.socket != socket.SocketType)
 
-        socket.socket = fakesock.socket
-        socket._socketobject = fakesock.socket
-        if not bad_socket_shadow:
-            socket.SocketType = fakesock.socket
 
-        socket.create_connection = create_fake_connection
-        socket.gethostname = fake_gethostname
-        socket.gethostbyname = fake_gethostbyname
-        socket.getaddrinfo = fake_getaddrinfo
+def apply_patch_socket():
+    # Some versions of python internally shadowed the
+    # SocketType variable incorrectly https://bugs.python.org/issue20386
+    bad_socket_shadow = (socket.socket != socket.SocketType)
 
-        socket.__dict__['socket'] = fakesock.socket
-        socket.__dict__['_socketobject'] = fakesock.socket
-        if not bad_socket_shadow:
-            socket.__dict__['SocketType'] = fakesock.socket
+    new_wrap = None
+    socket.socket = fakesock.socket
+    socket.socketpair = fake_socketpair
+    socket._socketobject = fakesock.socket
+    if not bad_socket_shadow:
+        socket.SocketType = fakesock.socket
 
-        socket.__dict__['create_connection'] = create_fake_connection
-        socket.__dict__['gethostname'] = fake_gethostname
-        socket.__dict__['gethostbyname'] = fake_gethostbyname
-        socket.__dict__['getaddrinfo'] = fake_getaddrinfo
+    socket.create_connection = create_fake_connection
+    socket.gethostname = fake_gethostname
+    socket.gethostbyname = fake_gethostbyname
+    socket.getaddrinfo = fake_getaddrinfo
 
-        if socks:
-            socks.socksocket = fakesock.socket
-            socks.__dict__['socksocket'] = fakesock.socket
+    socket.__dict__['socket'] = fakesock.socket
+    socket.__dict__['socketpair'] = fake_socketpair
+    socket.__dict__['_socketobject'] = fakesock.socket
+    if not bad_socket_shadow:
+        socket.__dict__['SocketType'] = fakesock.socket
 
-        if ssl:
-            new_wrap = partial(fake_wrap_socket, old_ssl_wrap_socket)
-            ssl.wrap_socket = new_wrap
-            ssl.SSLSocket = FakeSSLSocket
-            try:
-                ssl.SSLContext.wrap_socket = partial(fake_wrap_socket, old_sslcontext_wrap_socket)
-            except AttributeError:
-                pass
+    socket.__dict__['create_connection'] = create_fake_connection
+    socket.__dict__['gethostname'] = fake_gethostname
+    socket.__dict__['gethostbyname'] = fake_gethostbyname
+    socket.__dict__['getaddrinfo'] = fake_getaddrinfo
 
-            ssl.__dict__['wrap_socket'] = new_wrap
-            ssl.__dict__['SSLSocket'] = FakeSSLSocket
 
-            if not PY3:
-                ssl.sslwrap_simple = new_wrap
-                ssl.__dict__['sslwrap_simple'] = new_wrap
+    if pyopenssl_override:
+        # Take out the pyopenssl version - use the default implementation
+        extract_from_urllib3()
 
-        if requests_urllib3_connection is not None:
-            new_wrap = partial(fake_wrap_socket, old_requests_ssl_wrap_socket)
-            requests_urllib3_connection.ssl_wrap_socket = new_wrap
-            requests_urllib3_connection.__dict__['ssl_wrap_socket'] = new_wrap
+    if requests_urllib3_connection is not None:
+        urllib3_wrap = partial(fake_wrap_socket, old_requests_ssl_wrap_socket)
+        requests_urllib3_connection.ssl_wrap_socket = urllib3_wrap
+        requests_urllib3_connection.__dict__['ssl_wrap_socket'] = urllib3_wrap
+
+    if eventlet:
+        eventlet.green.ssl.GreenSSLContext = old_sslcontext_class
+        eventlet.green.ssl.__dict__['GreenSSLContext'] = old_sslcontext_class
+        eventlet.green.ssl.SSLContext = old_sslcontext_class
+        eventlet.green.ssl.__dict__['SSLContext'] = old_sslcontext_class
+
+    if socks:
+        socks.socksocket = fakesock.socket
+        socks.__dict__['socksocket'] = fakesock.socket
+
+    if ssl:
+        new_wrap = partial(fake_wrap_socket, old_ssl_wrap_socket)
+        ssl.wrap_socket = new_wrap
+        ssl.SSLSocket = FakeSSLSocket
+        ssl.SSLContext = old_sslcontext_class
+        try:
+            ssl.SSLContext.wrap_socket = partial(fake_wrap_socket, old_ssl_wrap_socket)
+        except AttributeError:
+            pass
+
+        ssl.__dict__['wrap_socket'] = new_wrap
+        ssl.__dict__['SSLSocket'] = FakeSSLSocket
+        ssl.__dict__['SSLContext'] = old_sslcontext_class
+
+
+def undo_patch_socket():
+    socket.socket = old_socket
+    socket.socketpair = old_socketpair
+    socket.SocketType = old_SocketType
+    socket._socketobject = old_socket
+
+    socket.create_connection = old_create_connection
+    socket.gethostname = old_gethostname
+    socket.gethostbyname = old_gethostbyname
+    socket.getaddrinfo = old_getaddrinfo
+
+    socket.__dict__['socket'] = old_socket
+    socket.__dict__['socketpair'] = old_socketpair
+    socket.__dict__['_socketobject'] = old_socket
+    socket.__dict__['SocketType'] = old_SocketType
+
+    socket.__dict__['create_connection'] = old_create_connection
+    socket.__dict__['gethostname'] = old_gethostname
+    socket.__dict__['gethostbyname'] = old_gethostbyname
+    socket.__dict__['getaddrinfo'] = old_getaddrinfo
+
+    if socks:
+        socks.socksocket = old_socksocket
+        socks.__dict__['socksocket'] = old_socksocket
+
+    if ssl:
+        ssl.wrap_socket = old_ssl_wrap_socket
+        ssl.SSLSocket = old_sslsocket
+        try:
+            ssl.SSLContext.wrap_socket = old_sslcontext_wrap_socket
+        except AttributeError:
+            pass
+        ssl.__dict__['wrap_socket'] = old_ssl_wrap_socket
+        ssl.__dict__['SSLSocket'] = old_sslsocket
+
+    if requests_urllib3_connection is not None:
+        requests_urllib3_connection.ssl_wrap_socket = \
+            old_requests_ssl_wrap_socket
+        requests_urllib3_connection.__dict__['ssl_wrap_socket'] = \
+            old_requests_ssl_wrap_socket
+
+    if pyopenssl_override:
+        # Put the pyopenssl version back in place
+        inject_into_urllib3()
+
+
+@contextlib.contextmanager
+def restored_libs():
+    undo_patch_socket()
+    yield
+    apply_patch_socket()
 
 
 class httprettized(object):
     """`context-manager <https://docs.python.org/3/reference/datamodel.html#context-managers>`_ for enabling HTTPretty.
+
+    .. tip:: Also available under the alias :py:func:`httpretty.enabled`
 
     .. testcode::
 
@@ -1586,7 +1748,7 @@ class httprettized(object):
         httpretty.reset()
         httpretty.enable(allow_net_connect=self.allow_net_connect)
 
-    def __exit__(self, exc_type, exc_value, traceback):
+    def __exit__(self, exc_type, exc_value, db):
         httpretty.disable()
         httpretty.reset()
 
@@ -1702,7 +1864,7 @@ def httprettified(test=None, allow_net_connect=True):
                 return test(*args, **kw)
         return wrapper
 
-    if isinstance(test, ClassTypes):
+    if isinstance(test, type):
         return decorate_class(test)
     elif callable(test):
         return decorate_callable(test)

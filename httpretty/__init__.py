@@ -1,7 +1,7 @@
 # #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # <HTTPretty - HTTP client mock for Python>
-# Copyright (C) <2011-2018>  Gabriel Falcao <gabriel@nacaolivre.org>
+# Copyright (C) <2011-2020> Gabriel Falcão <gabriel@nacaolivre.org>
 #
 # Permission is hereby granted, free of charge, to any person
 # obtaining a copy of this software and associated documentation
@@ -25,7 +25,10 @@
 # OTHER DEALINGS IN THE SOFTWARE.
 # flake8: noqa
 
+
 from . import core
+
+from .core import httpretty, httprettified, EmptyRequestHeaders
 from .errors import HTTPrettyError, UnmockedError
 from .version import version
 
@@ -54,13 +57,21 @@ reset = httpretty.reset
 Response = httpretty.Response
 
 GET = httpretty.GET
+"""Match requests of GET method"""
 PUT = httpretty.PUT
+"""Match requests of PUT method"""
 POST = httpretty.POST
+"""Match requests of POST method"""
 DELETE = httpretty.DELETE
+"""Match requests of DELETE method"""
 HEAD = httpretty.HEAD
+"""Match requests of HEAD method"""
 PATCH = httpretty.PATCH
+"""Match requests of OPTIONS method"""
 OPTIONS = httpretty.OPTIONS
+"""Match requests of OPTIONS method"""
 CONNECT = httpretty.CONNECT
+"""Match requests of CONNECT method"""
 
 
 def last_request():

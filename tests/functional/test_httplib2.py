@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 # <HTTPretty - HTTP client mock for Python>
-# Copyright (C) <2011-2018>  Gabriel Falcão <gabriel@nacaolivre.org>
+# Copyright (C) <2011-2020> Gabriel Falcão <gabriel@nacaolivre.org>
 #
 # Permission is hereby granted, free of charge, to any person
 # obtaining a copy of this software and associated documentation
@@ -28,6 +28,7 @@ from __future__ import unicode_literals
 
 import re
 import httplib2
+from freezegun import freeze_time
 from sure import expect, within, microseconds
 from httpretty import HTTPretty, httprettified
 from httpretty.core import decode_utf8
@@ -64,8 +65,8 @@ def test_httpretty_provides_easy_access_to_querystrings(now):
 
 
 @httprettified
-@within(two=microseconds)
-def test_httpretty_should_mock_headers_httplib2(now):
+@freeze_time("2013-10-04 04:20:00")
+def test_httpretty_should_mock_headers_httplib2():
     "HTTPretty should mock basic headers with httplib2"
 
     HTTPretty.register_uri(HTTPretty.GET, "http://github.com/",
@@ -80,13 +81,13 @@ def test_httpretty_should_mock_headers_httplib2(now):
         'content-length': '35',
         'status': '201',
         'server': 'Python/HTTPretty',
-        'date': now.strftime('%a, %d %b %Y %H:%M:%S GMT'),
+        'date': 'Fri, 04 Oct 2013 04:20:00 GMT',
     })
 
 
 @httprettified
-@within(two=microseconds)
-def test_httpretty_should_allow_adding_and_overwritting_httplib2(now):
+@freeze_time("2013-10-04 04:20:00")
+def test_httpretty_should_allow_adding_and_overwritting_httplib2():
     "HTTPretty should allow adding and overwritting headers with httplib2"
 
     HTTPretty.register_uri(HTTPretty.GET, "http://github.com/foo",
@@ -106,7 +107,7 @@ def test_httpretty_should_allow_adding_and_overwritting_httplib2(now):
         'content-length': '27',
         'status': '200',
         'server': 'Apache',
-        'date': now.strftime('%a, %d %b %Y %H:%M:%S GMT'),
+        'date': 'Fri, 04 Oct 2013 04:20:00 GMT',
     })
 
 
@@ -135,8 +136,8 @@ def test_httpretty_should_allow_forcing_headers_httplib2(now):
 
 
 @httprettified
-@within(two=microseconds)
-def test_httpretty_should_allow_adding_and_overwritting_by_kwargs_u2(now):
+@freeze_time("2013-10-04 04:20:00")
+def test_httpretty_should_allow_adding_and_overwritting_by_kwargs_u2():
     "HTTPretty should allow adding and overwritting headers by keyword args " \
         "with httplib2"
 
@@ -159,7 +160,7 @@ def test_httpretty_should_allow_adding_and_overwritting_by_kwargs_u2(now):
         'content-length': '27',
         'status': '200',
         'server': 'Apache',
-        'date': now.strftime('%a, %d %b %Y %H:%M:%S GMT'),
+        'date': 'Fri, 04 Oct 2013 04:20:00 GMT',
     })
 
 
@@ -264,7 +265,7 @@ def test_httpretty_ignores_querystrings_from_registered_uri(now):
 @httprettified
 @within(two=microseconds)
 def test_callback_response(now):
-    ("HTTPretty should all a callback function to be set as the body with"
+    ("HTTPretty should call a callback function to be set as the body with"
      " httplib2")
 
     def request_callback(request, uri, headers):
@@ -295,11 +296,11 @@ def test_httpretty_should_allow_registering_regexes():
 
     HTTPretty.register_uri(
         HTTPretty.GET,
-        re.compile(r"https://api.yipit.com/v1/deal;brand=(?P<brand_name>\w+)"),
+        'http://api.yipit.com/v1/deal;brand=gap',
         body="Found brand",
     )
 
-    response, body = httplib2.Http().request('https://api.yipit.com/v1/deal;brand=gap', 'GET')
+    response, body = httplib2.Http().request('http://api.yipit.com/v1/deal;brand=gap', 'GET')
     expect(body).to.equal(b'Found brand')
     expect(HTTPretty.last_request.method).to.equal('GET')
     expect(HTTPretty.last_request.path).to.equal('/v1/deal;brand=gap')

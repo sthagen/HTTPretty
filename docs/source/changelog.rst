@@ -1,6 +1,43 @@
 Release Notes
 =============
 
+1.0.5
+-----
+
+- Bugfix: Support `socket.socketpair() <https://docs.python.org/3/library/socket.html#socket.socketpair>`_ . `#402 <https://github.com/gabrielfalcao/HTTPretty/issues/402>`_
+- Bugfix: Prevent exceptions from re-applying monkey patches. `#406 <https://github.com/gabrielfalcao/HTTPretty/issues/406>`_
+
+1.0.4
+-----
+
+- Python 3.8 and 3.9 support. `#407 <https://github.com/gabrielfalcao/HTTPretty/issues/407>`_
+
+1.0.3
+-----
+
+- Fix compatibility with urllib3>=1.26. `#410 <https://github.com/gabrielfalcao/HTTPretty/pull/410>`_
+
+1.0.0
+-----
+
+- Drop Python 2 support.
+- Fix usage with redis and improve overall real-socket passthrough. `#271 <https://github.com/gabrielfalcao/HTTPretty/issues/271>`_.
+- Fix TypeError: wrap_socket() missing 1 required positional argument: 'sock' (`#393 <https://github.com/gabrielfalcao/HTTPretty/pull/393>`_)
+- Merge pull request `#364 <https://github.com/gabrielfalcao/HTTPretty/pull/364>`_
+- Merge pull request `#371 <https://github.com/gabrielfalcao/HTTPretty/pull/371>`_
+- Merge pull request `#379 <https://github.com/gabrielfalcao/HTTPretty/pull/379>`_
+- Merge pull request `#386 <https://github.com/gabrielfalcao/HTTPretty/pull/386>`_
+- Merge pull request `#302 <https://github.com/gabrielfalcao/HTTPretty/pull/302>`_
+- Merge pull request `#373 <https://github.com/gabrielfalcao/HTTPretty/pull/373>`_
+- Merge pull request `#383 <https://github.com/gabrielfalcao/HTTPretty/pull/383>`_
+- Merge pull request `#385 <https://github.com/gabrielfalcao/HTTPretty/pull/385>`_
+- Merge pull request `#389 <https://github.com/gabrielfalcao/HTTPretty/pull/389>`_
+- Merge pull request `#391 <https://github.com/gabrielfalcao/HTTPretty/pull/391>`_
+- Fix simple typo: neighter -> neither.
+- Updated documentation for register_uri concerning using ports.
+- Clarify relation between ``enabled`` and ``httprettized`` in API docs.
+- Align signature with builtin socket.
+
 0.9.4
 -----
 

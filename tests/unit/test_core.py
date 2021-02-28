@@ -1,16 +1,14 @@
-# #!/usr/bin/env python
-# -*- coding: utf-8 -*-
-from __future__ import unicode_literals
+import io
 import json
 import errno
-from datetime import datetime
 
-from mock import Mock, patch, call
+from freezegun import freeze_time
 from sure import expect
 
-from httpretty.compat import StringIO
 from httpretty.core import HTTPrettyRequest, FakeSSLSocket, fakesock, httpretty
 from httpretty.core import URIMatcher, URIInfo
+
+from tests.compat import Mock, patch, call
 
 
 class SocketErrorStub(Exception):
@@ -44,12 +42,12 @@ def test_request_stubs_internals():
         'user-agent': 'Python-urllib/2.7'
     })
 
-    # And the `rfile` should be a StringIO
-    type_as_str = StringIO.__module__ + '.' + StringIO.__name__
+    # And the `rfile` should be a io.BytesIO
+    type_as_str = io.BytesIO.__module__ + '.' + io.BytesIO.__name__
 
     request.should.have.property('rfile').being.a(type_as_str)
 
-    # And the `wfile` should be a StringIO
+    # And the `wfile` should be a io.BytesIO
     request.should.have.property('wfile').being.a(type_as_str)
 
     # And the `method` should be available
@@ -154,7 +152,7 @@ def test_request_parse_body_when_unrecognized():
 
 
 def test_request_string_representation():
-    ("HTTPrettyRequest should have a debug-friendly "
+    ("HTTPrettyRequest should have a forward_and_trace-friendly "
      "string representation")
 
     # Given a request string containing a unicode encoded querystring
@@ -189,12 +187,9 @@ def test_fake_ssl_socket_proxies_its_ow_socket():
     socket.send.assert_called_once_with("FOO")
 
 
-@patch('httpretty.core.datetime')
-def test_fakesock_socket_getpeercert(dt):
+@freeze_time("2013-10-04 04:20:00")
+def test_fakesock_socket_getpeercert():
     ("fakesock.socket#getpeercert should return a hardcoded fake certificate")
-    # Background:
-    dt.now.return_value = datetime(2013, 10, 4, 4, 20, 0)
-
     # Given a fake socket instance
     socket = fakesock.socket()
 
@@ -251,27 +246,21 @@ def test_fakesock_socket_connect_fallback(POTENTIAL_HTTP_PORTS, old_socket):
     # Then it should have open a real connection in the background
     old_socket.return_value.connect.assert_called_once_with(('somewhere.com', 42))
 
-    # And _closed is set to False
-    socket._closed.should.be.false
-
 
 @patch('httpretty.core.old_socket')
 def test_fakesock_socket_close(old_socket):
     ("fakesock.socket#close should close the actual socket in case "
-     "it's not http and _closed is False")
+     "it's not http and __truesock_is_connected__ is True")
     # Given a fake socket instance that is synthetically open
     socket = fakesock.socket()
-    socket._closed = False
-    socket._connected_truesock = True
+    socket.__truesock_is_connected__ = True
 
     # When I close it
     socket.close()
 
     # Then its real socket should have been closed
     old_socket.return_value.close.assert_called_once_with()
-
-    # And _closed is set to True
-    socket._closed.should.be.true
+    socket.__truesock_is_connected__.should.be.false
 
 
 @patch('httpretty.core.old_socket')
@@ -315,8 +304,8 @@ def test_fakesock_socket_real_sendall(old_socket):
     # Then it should have called sendall in the real socket
     real_socket.sendall.assert_called_once_with(b"SOMEDATA", b'some extra args...', foo=b'bar')
 
-    # And setblocking was never called
-    real_socket.setblocking.called.should.be.false
+    # # And setblocking was never called
+    # real_socket.setblocking.called.should.be.false
 
     # And recv was never called
     real_socket.recv.called.should.be.false
@@ -339,6 +328,7 @@ def test_fakesock_socket_real_sendall_when_http(old_socket):
 
     # Given a fake socket
     socket = fakesock.socket()
+    socket._address = ('1.2.3.4', 42)
     socket.is_http = True
 
     # When I call real_sendall with data, some args and kwargs
@@ -374,6 +364,7 @@ def test_fakesock_socket_real_sendall_continue_eagain_when_http(socket, old_sock
 
     # Given a fake socket
     socket = fakesock.socket()
+    socket._address = ('1.2.3.4', 42)
     socket.is_http = True
 
     # When I call real_sendall with data, some args and kwargs
@@ -409,6 +400,7 @@ def test_fakesock_socket_real_sendall_socket_error_when_http(socket, old_socket)
 
     # Given a fake socket
     socket = fakesock.socket()
+    socket._address = ('1.2.3.4', 42)
     socket.is_http = True
 
     # When I call real_sendall with data, some args and kwargs
@@ -520,8 +512,7 @@ def test_fakesock_socket_sendall_with_valid_requestline_2(POTENTIAL_HTTP_PORTS, 
 
 
 @patch('httpretty.core.old_socket')
-@patch('httpretty.core.POTENTIAL_HTTP_PORTS')
-def test_fakesock_socket_sendall_with_body_data_no_entry(POTENTIAL_HTTP_PORTS, old_socket):
+def test_fakesock_socket_sendall_with_body_data_no_entry(old_socket):
     ("fakesock.socket#sendall should call real_sendall when not parsing headers and there is no entry")
     # Background:
     # Using a subclass of socket that mocks out real_sendall
@@ -608,6 +599,25 @@ def test_fakesock_socket_sendall_with_body_data_with_chunked_entry(POTENTIAL_HTT
 
     # Then the entry should have that body
     httpretty.last_request.body.should.equal(b'BLABLABLABLA')
+
+
+def test_fakesock_socket_sendall_with_path_starting_with_two_slashes():
+    ("fakesock.socket#sendall handles paths starting with // well")
+
+    httpretty.register_uri(httpretty.GET, 'http://example.com//foo')
+
+    class MySocket(fakesock.socket):
+        def real_sendall(self, data, *args, **kw):
+            raise AssertionError('should never call this...')
+
+    # Given an instance of that socket
+    socket = MySocket()
+
+    # And that is is considered http
+    socket.connect(('example.com', 80))
+
+    # When I try to send data
+    socket.sendall(b"GET //foo HTTP/1.1\r\nContent-Type: application/json\r\n\r\n")
 
 
 def test_URIMatcher_respects_querystring():
